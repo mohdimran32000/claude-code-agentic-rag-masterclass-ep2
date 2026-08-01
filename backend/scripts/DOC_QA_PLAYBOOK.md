@@ -82,7 +82,8 @@ the variants listed in the caveats section.
 - [spec] How long does the Net2 Plus retain data during total power loss? → 30 days
 - [spec] What is the moisture/IP rating of the P50 proximity reader? → IPX7
 - [spec] What is the holding force of the electromagnetic locks? → 600 lbs (double magnet version 2×600 lbs)
-- [entity] Who is the system integrator project manager for the ACS? → Mr. Murugan PM, Integrated Ideal Solutions, 04 2820200
+- [entity] Which company is the system integrator for the ACS? → Integrated Ideal Solutions (IIS)
+  (individual's name + direct line redacted — see "Personal data" note at the end)
 - [entity] What warranty did the installer (IIS) give on the ACS? → 3 years from March 1, 2021
 - [entity] What is Paxton's manufacturer warranty? → 5 years from date of shipment
 - [spec] How many access cards are in the ACS asset register? → 500 (plus 1 Net2 USB desktop reader)
@@ -125,7 +126,8 @@ the variants listed in the caveats section.
 - [spec] What is the spare FCU controller item code and recommended quantity? → DXR2.M09-101A, qty 10
 - [spec] How many BACnet routers (PXG3.M) are in the asset register? → 12
 - [maintenance] What happens to the FAHU supply fan when smoke/fire is detected? → shuts down and dampers close
-- [entity] What is the Siemens project contact number? → +971 4 366 0884 (Samir Amin)
+- [entity] Which company is the BMS project contact? → Siemens LLC Building Technologies
+  (named individual + direct line redacted — see "Personal data" note at the end)
 - [negative] What make/model is the chiller plant? → not in this manual (BMS covers controls only)
 - [negative] How many CCTV cameras connect to the BMS? → not stated (CCTV integrated as one software point only)
 
@@ -159,7 +161,8 @@ the variants listed in the caveats section.
 - [spec] Rated short-time withstand current? → up to 36 kA for 1s (2500A switchboard); peak up to 45 kA
 - [location] Which building does each MDB serve? → MDB-C-G2 → Building B; MDB-C-G3 → Building C
 - [entity] How long is the GDS panel warranty? → 12 months (letter SM21-0094-MH-WL, dated 28-02-2021)
-- [entity] Who are the GDS project contacts? → Mohamed Azharudeen (Project Engineer) and Sainudeen Shamnad (Project Manager)
+- [entity] What roles are listed as GDS project contacts? → a Project Engineer and a Project Manager
+  (both individuals' names redacted — see "Personal data" note at the end)
 - [spec] What power monitoring unit is installed? → Schneider EasyLogic PM2120 (METSEPM2120)
 - [spec] What construction/incomer do the SMDBs use? → Form-2 load-bank type, isolator incomer
 - [spec] How are final-DB devices mounted? → RCBO/RCCB outgoing, all DIN-rail mounted
@@ -194,7 +197,8 @@ the variants listed in the caveats section.
 - [spec] What utility sink model is in the Level 6 labs / GF workshops? → 'Medina' stainless steel, Model LT.148.210, by Griffin
 - [spec] What sink model is in the Level 4 Fab Lab / Model Workshop / Fashion Lab? → 'Trinity' compartment industrial sink, TR.144.40, by Griffin
 - [entity] What is the sanitary fit-out warranty? → 1 year from Substantial Completion, 01/03/2021
-- [entity] Who signed the Khansaheb warranty certificate? → Ross Trivett, General Manager
+- [entity] What role signed the Khansaheb warranty certificate? → the General Manager
+  (signatory's name redacted — see "Personal data" note at the end)
 - [maintenance] What is the lead time for a replacement hand dryer? → 4–5 weeks (Bobrick, via Kitchen & Bath Gallery)
 - [location] Where is the 700mm foldable grab rail installed? → Level 3 Disabled Toilets (Franke)
 - [entity] What is Aquazone's phone number? → (+971) 4 349 3771
@@ -333,3 +337,21 @@ Stack: chat model gemini-3.1-flash-lite, reranker gemini-flash-lite-latest
 7. Report a scorecard: cases per document/category/layer, initial vs final
    pass rate, fixes applied, retrieval quality notes (e.g., chunks that
    needed tuning), remaining caveats. Commit the changes.
+
+## Personal data — do not re-add (redacted 2026-08-01)
+
+This repo is PUBLIC. Five named individuals and two direct phone numbers were
+removed from the question bank above (ACS system integrator PM, Siemens BMS
+contact, two GDS project contacts, Khansaheb warranty signatory). They are
+third parties' personal data and must not be reintroduced, even though they
+appear in the source O&M manuals.
+
+- **Do not restore them** when extending the question bank. Ask about the
+  *company* or the *role* instead — as the edited entries now do.
+- No eval case asserts on any of these names, so nothing under
+  `backend/scripts/` needs to change to match this redaction.
+- Company names, published support hotlines (Pelco, Aquazone, Heatrae Sadia)
+  and the Culligan service address are business contact details and were
+  deliberately kept.
+- The source manuals in `Ref Screenshots/Final O&M's/` are untracked and still
+  contain the full details — that is fine, they never leave your machine.
