@@ -105,22 +105,25 @@ Both eval suites were audited to **two consecutive 100% runs** (57/57 ×2 on the
    python -m venv venv
    venv/Scripts/pip install -r requirements.txt   # Windows; use venv/bin/pip on macOS/Linux
    ```
-   Create `backend/.env`:
+   Create `backend/.env` (copy `backend/.env.example` and fill it in):
    ```
    SUPABASE_URL=...
    SUPABASE_ANON_KEY=...
    SUPABASE_SERVICE_ROLE_KEY=...
    GEMINI_API_KEY=...
-   LANGSMITH_API_KEY=...        # optional, for tracing
-   LANGSMITH_PROJECT=...        # optional
+   LANGSMITH_API_KEY=...             # optional, for tracing
+   LANGSMITH_PROJECT=...             # optional
+   TEST_USER_ADMIN_PASSWORD=...      # optional, only needed to run the backend tests
    ```
+   Tavily (web search) and Cohere (reranking) keys are **not** env vars — set them in the admin **Settings** UI.
+
    Run: `venv/Scripts/python -m uvicorn app.main:app --port 8001`
 3. **Frontend**
    ```bash
    cd frontend
    npm install
    ```
-   Create `frontend/.env`:
+   Create `frontend/.env.local` (copy `frontend/.env.example` and fill it in):
    ```
    VITE_SUPABASE_URL=...
    VITE_SUPABASE_ANON_KEY=...
