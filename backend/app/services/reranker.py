@@ -81,7 +81,10 @@ Query: {query}
 
 Return a JSON object with a "rankings" array, one entry per chunk. Each element should have "index" (chunk number) and "score" (0.0-1.0). Include every chunk — do not filter."""
 
-    response = client.models.generate_content(
+    from app.services.llm_usage import generate_with_usage
+
+    response = generate_with_usage(
+        client,
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -89,44 +92,61 @@ Return a JSON object with a "rankings" array, one entry per chunk. Each element 
             response_schema=RerankResult,
             temperature=0.0,
         ),
+        name="rerank_llm",
     )
     result = RerankResult.model_validate_json(response.text)
     sorted_rankings = sorted(result.rankings, key=lambda r: r.score, reverse=True)[:top_k]
     return [chunks[r.index] for r in sorted_rankings if r.index < len(chunks)]
 
 
-def _rerank_cohere(query: str, chunks: List[str], top_k: int) -> List[str]:
-    """Use Cohere Rerank API to reorder chunks by relevance."""
-    import cohere
+def _rerank_cohere_scored(query: str, chunks: List[str], top_k: int, attempts: int = 3):
+    """Cohere rerank, keeping the relevance scores and retrying transient failures.
 
+    The scores were thrown away before. They are the only calibrated signal the
+    system has for "none of this actually answers the question", which is what
+    the abstain gate needs.
+
+    Retry matters because the previous behaviour returned the unranked RRF top-k
+    on ANY exception, with a log line and no signal to the caller - so a Cohere
+    blip and a good rerank were indistinguishable downstream.
+    """
+    import cohere, time
     api_key = get_cohere_api_key()
     if not api_key:
         logger.warning("Cohere API key not set, skipping reranking")
-        return chunks[:top_k]
-
+        return [(c, None) for c in chunks[:top_k]]
     client = cohere.ClientV2(api_key=api_key)
-    response = client.rerank(
-        model="rerank-v3.5",
-        query=query,
-        documents=chunks,
-        top_n=top_k,
-    )
-    return [chunks[r.index] for r in response.results]
+    last = None
+    for attempt in range(attempts):
+        try:
+            resp = client.rerank(model="rerank-v3.5", query=query,
+                                 documents=chunks, top_n=top_k)
+            return [(chunks[r.index], float(r.relevance_score)) for r in resp.results]
+        except Exception as e:
+            last = e
+            logger.warning(f"Cohere rerank attempt {attempt + 1}/{attempts} failed: {e}")
+            if attempt < attempts - 1:
+                time.sleep(2 ** attempt)
+    raise last
+
+
+@traceable(name="rerank_chunks_scored", run_type="chain")
+def rerank_chunks_scored(query: str, chunks: List[str], top_k: int = 5):
+    """Reranked (text, score) pairs. score is None when reranking did not run."""
+    if len(chunks) <= top_k:
+        return [(c, None) for c in chunks]
+    provider = get_reranking_provider()
+    try:
+        if provider == "cohere":
+            return _rerank_cohere_scored(query, chunks, top_k)
+        return [(c, None) for c in _rerank_gemini(query, chunks, top_k)]
+    except Exception as e:
+        logger.warning(f"Reranking failed ({provider}) after retries, "
+                       f"falling back to RRF order: {e}")
+        return [(c, None) for c in chunks[:top_k]]
 
 
 @traceable(name="rerank_chunks", run_type="chain")
 def rerank_chunks(query: str, chunks: List[str], top_k: int = 5) -> List[str]:
-    """Rerank chunks using the configured provider (Gemini or Cohere)."""
-    if len(chunks) <= top_k:
-        return chunks
-
-    provider = get_reranking_provider()
-
-    try:
-        if provider == "cohere":
-            return _rerank_cohere(query, chunks, top_k)
-        else:
-            return _rerank_gemini(query, chunks, top_k)
-    except Exception as e:
-        logger.warning(f"Reranking failed ({provider}), returning first {top_k} chunks: {e}")
-        return chunks[:top_k]
+    """Backwards-compatible: reranked chunk texts only."""
+    return [t for t, _ in rerank_chunks_scored(query, chunks, top_k)]
