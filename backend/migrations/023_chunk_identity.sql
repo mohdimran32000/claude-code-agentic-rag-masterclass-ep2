@@ -41,6 +41,21 @@
 -- the two target folders, but that is the app-level re-ingest step, not this SQL).
 
 -- ── 1. document_chunks: add the 7 identity columns ──
+-- ---------------------------------------------------------------------------
+-- TRANSACTION WRAPPER — added before this was run against the live database.
+--
+-- This migration DROPs both search RPCs before recreating them. Postgres DDL is
+-- transactional, so wrapping the whole file means either every statement lands or
+-- none does. Without the wrapper, a failure between the DROP and the CREATE would
+-- leave the live system with NO search function at all — and the app's failure
+-- mode there is silence, not an error (migration 021's ivfflat bug returned zero
+-- rows for weeks without anyone noticing).
+--
+-- CREATE INDEX (non-CONCURRENTLY) is transaction-safe, so the GIN index below is
+-- covered too.
+-- ---------------------------------------------------------------------------
+BEGIN;
+
 ALTER TABLE document_chunks
   ADD COLUMN IF NOT EXISTS file_name     TEXT,
   ADD COLUMN IF NOT EXISTS folder_path   TEXT,
@@ -232,3 +247,5 @@ $$ LANGUAGE plpgsql;
 -- No backfill UPDATE either: only rows inserted/updated after this migration
 -- (i.e. the om-waterheaters/om-firefighting re-ingest) run the new logic: tsv on
 -- every other row is untouched, so no other folder's keyword ranking moves.
+
+COMMIT;
