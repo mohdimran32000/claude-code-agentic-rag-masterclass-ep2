@@ -66,10 +66,11 @@ def _execute_with_timeout(con, sql, timeout=SQL_QUERY_TIMEOUT):
 
 # doc-prep is a sibling of this repo under the same parent folder — see
 # doc-prep/CLAUDE.md and doc-prep/11_table_cards.py. Cards are generated
-# there (deterministically, from verified manifests) and read here only
-# when RETRIEVAL_TABLE_ROUTER is on; a missing file degrades to the
-# unrouted (flag-off) behaviour rather than raising, so a doc-prep-side
-# checkout problem can never take the SQL tool down in production.
+# there (deterministically, from verified manifests) and read here
+# unconditionally (the router shipped 2026-08-30, no flag); a missing file
+# degrades to the unrouted (no-cards) behaviour rather than raising, so a
+# doc-prep-side checkout problem can never take the SQL tool down in
+# production.
 _TABLE_CARDS_PATH = (
     Path(__file__).resolve().parents[5] / "doc-prep" / "eval" / "table_cards.json"
 )
@@ -255,8 +256,8 @@ def execute_sql_query(question: str, user_id: str, supabase_client) -> str:
     # to anchor against, and 6 of 33 eval_rag_vs_truth.py cases flipped to
     # the wrong (historical) table in one run. This note is cheap (~40
     # tokens per pair) and unconditional — it fixes a latent ambiguity in
-    # the corpus itself, not something specific to the router, so it stays
-    # on regardless of RETRIEVAL_TABLE_ROUTER.
+    # the corpus itself, not something specific to the router, so it runs
+    # every time, whether or not the router actually narrowed `tables`.
     existing_pairs = []
     live_names = {t["table_name"] for t in tables}
     for t in tables:

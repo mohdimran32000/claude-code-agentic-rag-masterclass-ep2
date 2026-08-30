@@ -134,7 +134,7 @@ def _card_vocab_words(card: dict) -> set[str]:
     return _meaningful_words(tokens)
 
 
-def _document_frequency(cards: list[dict]) -> dict:
+def _document_frequency(cards: list[dict], card_words: dict) -> dict:
     """How many cards a word appears in (subject words + vocab words
     combined) — the denominator of a simple TF-IDF-style down-weighting.
 
@@ -149,21 +149,29 @@ def _document_frequency(cards: list[dict]) -> dict:
     tables it shows up in (so 'fcu' — one table only — outweighs 'floor' —
     several) fixes this without hand-listing generic words, the same way
     real search engines discount common terms.
+
+    `card_words` is `select_tables`'s once-per-call {id(card): (subject,
+    vocab)} map — every card's word sets are read from it rather than
+    recomputed here, since every card in `cards` needs them again in
+    `_score` right after this.
     """
     df = {}
     for card in cards:
-        for w in _card_subject_words(card) | _card_vocab_words(card):
+        subject, vocab = card_words[id(card)]
+        for w in subject | vocab:
             df[w] = df.get(w, 0) + 1
     return df
 
 
-def _score(question_words: set[str], question_prefixes: set[str], card: dict, df: dict) -> float:
+def _score(question_words: set[str], question_prefixes: set[str], card: dict,
+           df: dict, card_words: dict) -> float:
     score = 0.0
     prefixes = set(card.get("identifier_prefixes", []))
     score += 6 * len(question_prefixes & prefixes)
-    for w in question_words & _card_vocab_words(card):
+    subject, vocab = card_words[id(card)]
+    for w in question_words & vocab:
         score += 3 / df.get(w, 1)
-    for w in question_words & _card_subject_words(card):
+    for w in question_words & subject:
         score += 1 / df.get(w, 1)
     return score
 
@@ -185,10 +193,17 @@ def select_tables(question: str, cards: list[dict], k: int = 3) -> list[str]:
 
     qwords = _question_words(question)
     qprefixes = _question_prefixes(question)
-    df = _document_frequency(cards)
+    # Each card's subject/vocab word sets are pure functions of the card,
+    # but both _document_frequency and _score need them for every card —
+    # computed once per card here (keyed by identity, scoped to this call
+    # only) rather than twice, which matters at the corpus sizes this router
+    # exists for (doc-prep/12_scale_probe.py projects 1,000 tables).
+    card_words = {id(card): (_card_subject_words(card), _card_vocab_words(card))
+                  for card in cards}
+    df = _document_frequency(cards, card_words)
 
     scored = [
-        (_score(qwords, qprefixes, card, df), i, card["table"])
+        (_score(qwords, qprefixes, card, df, card_words), i, card["table"])
         for i, card in enumerate(cards)
     ]
     scored.sort(key=lambda t: (-t[0], t[1]))

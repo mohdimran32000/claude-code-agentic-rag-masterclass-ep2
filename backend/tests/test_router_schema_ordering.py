@@ -22,11 +22,11 @@ def check(name, cond, detail=""):
     if not cond: FAILS.append(name)
 
 
-# ---------------------------------------------------------------- sql_tool.py
-print("sql_tool.execute_sql_query() -- deterministic schema ordering")
-
-class _SchemaQuery:
-    """Records the query chain so the test can assert what production sends."""
+class _TableMenuQuery:
+    """Fake .select().eq().order().limit().execute() chain for a single-table
+    query, recording what was called so a test can assert what production
+    sends. Shared by both scenarios below (sql_tool's schema fetch never
+    calls .limit(), so limit_applied simply stays None for that one)."""
     def __init__(self, rows):
         self.rows = rows
         self.order_applied = None
@@ -41,11 +41,17 @@ class _SchemaQuery:
         return self
     def execute(self):
         rows = sorted(self.rows, key=lambda r: r["table_name"]) if self.order_applied else self.rows
+        if self.limit_applied is not None:
+            rows = rows[: self.limit_applied]
         class R: data = rows
         return R()
 
+
+# ---------------------------------------------------------------- sql_tool.py
+print("sql_tool.execute_sql_query() -- deterministic schema ordering")
+
 class _SchemaSB:
-    def __init__(self, rows): self.q = _SchemaQuery(rows)
+    def __init__(self, rows): self.q = _TableMenuQuery(rows)
     def table(self, name): return self.q
 
 from app.services import sql_tool as st
@@ -89,30 +95,10 @@ class _DocumentsQuery:
         class R: data = []
         return R()
 
-class _RouterQuery:
-    """The one that matters: structured_data, the router's table menu."""
-    def __init__(self, rows):
-        self.rows = rows
-        self.order_applied = None
-        self.limit_applied = None
-    def select(self, *a, **k): return self
-    def eq(self, *a, **k): return self
-    def order(self, col, **k):
-        self.order_applied = col
-        return self
-    def limit(self, n):
-        self.limit_applied = n
-        return self
-    def execute(self):
-        rows = sorted(self.rows, key=lambda r: r["table_name"]) if self.order_applied else self.rows
-        if self.limit_applied is not None:
-            rows = rows[: self.limit_applied]
-        class R: data = rows
-        return R()
-
 class _FakeSupabase:
+    """structured_data is the one that matters: the router's table menu."""
     def __init__(self, structured_rows):
-        self.router_query = _RouterQuery(structured_rows)
+        self.router_query = _TableMenuQuery(structured_rows)
         self._tables = {
             "threads": _ThreadQuery(),
             "messages": _MessagesQuery(),

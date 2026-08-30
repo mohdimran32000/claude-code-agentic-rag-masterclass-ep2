@@ -228,9 +228,11 @@ _MD_TABLE_SEP_RE = re.compile(r"^\s*\|?(\s*:?-{1,}:?\s*\|)+\s*:?-{1,}:?\s*\|?\s*
 _MD_TREE_LINE_RE = re.compile(r"[│├└]")  # │ ├ └
 
 
-def _md_estimate_tokens(s: str) -> int:
-    """Same chars/4 heuristic already used by _split_by_token_budget - kept
-    consistent rather than introducing a second estimator."""
+def _estimate_tokens(s: str) -> int:
+    """~4 chars per token, a conservative estimate. The one estimator for
+    this heuristic in the module — also used by `_split_by_token_budget`
+    below, so the markdown-chunking token budget and the embedding-batch
+    token budget can never quietly drift onto two different formulas."""
     return len(s) // 4 + 1
 
 
@@ -253,7 +255,7 @@ class _MdAtom:
 
     @property
     def tokens(self) -> int:
-        return _md_estimate_tokens(self.text)
+        return _estimate_tokens(self.text)
 
 
 def _parse_md_atoms(text: str) -> List[_MdAtom]:
@@ -354,13 +356,13 @@ def _split_md_table(atom: _MdAtom, chunk_size: int) -> List[str]:
     header_lines = atom.lines[:2]
     data_lines = atom.lines[2:]
     header_text = "\n".join(header_lines)
-    header_tokens = _md_estimate_tokens(header_text)
+    header_tokens = _estimate_tokens(header_text)
 
     groups: List[str] = []
     current: List[str] = []
     current_tokens = header_tokens
     for row in data_lines:
-        row_tokens = _md_estimate_tokens(row)
+        row_tokens = _estimate_tokens(row)
         if current and current_tokens + row_tokens > chunk_size:
             groups.append(header_text + "\n" + "\n".join(current))
             current, current_tokens = [], header_tokens
@@ -640,7 +642,7 @@ def _split_by_token_budget(texts: List[str], max_tokens: int = 18000, max_items:
     current_batch = []
     current_tokens = 0
     for text in texts:
-        est_tokens = len(text) // 4 + 1
+        est_tokens = _estimate_tokens(text)
         if current_batch and (current_tokens + est_tokens > max_tokens or len(current_batch) >= max_items):
             batches.append(current_batch)
             current_batch = []
