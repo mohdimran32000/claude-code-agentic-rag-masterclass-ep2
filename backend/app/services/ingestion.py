@@ -10,15 +10,27 @@ import logging
 import re
 import tempfile
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 from google import genai
 
+from app.services import retrieval_flags
 from app.services.record_manager import compute_chunk_hash, compute_file_hash
 
 logger = logging.getLogger(__name__)
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-EMBEDDING_DIMS = 768  # Truncate to 768 dims (pgvector ivfflat max is 2000)
+# 1536, not 768 (migration 022). The old 768 cited an ivfflat limit that migration 021
+# removed when it moved the index to HNSW. Not 3072 (the model's native size) because
+# pgvector's HNSW index tops out at 2000 dims — above that every search degrades to a
+# full sequential scan.
+EMBEDDING_DIMS = 1536
+
+# Gemini embeds a question and a document differently when told which is which.
+# Without this, a query's nearest neighbour is often another QUESTION rather than the
+# passage that answers it. Both sides must stay consistent — changing either one
+# requires re-embedding the corpus.
+TASK_TYPE_DOCUMENT = "RETRIEVAL_DOCUMENT"
+TASK_TYPE_QUERY = "RETRIEVAL_QUERY"
 _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 
@@ -158,6 +170,429 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     return chunks
 
 
+def chunk_csv(text: str, chunk_size: int = 500) -> List[str]:
+    """Chunk a CSV on ROW boundaries, repeating the header in every chunk.
+
+    The word-based splitter cuts a CSV wherever the word count lands — mid-value,
+    mid-quoted-field — and only the first chunk ever carries the column names. A
+    retrieved chunk then reads as bare values with no idea which column they are
+    in or which entity the row describes. Cutting on rows and repeating the header
+    makes every chunk self-describing.
+
+    Returns [] when the text does not parse as a CSV with at least a header and one
+    data row, so the caller can fall back to chunk_text() unchanged.
+    """
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except (csv.Error, ValueError):
+        return []
+    rows = [r for r in rows if any((c or "").strip() for c in r)]
+    if len(rows) < 2:
+        return []
+
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow(rows[0])
+    header = buf.getvalue().rstrip("\n")
+    header_words = len(header.split())
+    if header_words >= chunk_size:
+        return []  # pathological header - leave it to the word splitter
+
+    chunks: List[str] = []
+    current: List[str] = []
+    current_words = header_words
+
+    for row in rows[1:]:
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerow(row)
+        line = buf.getvalue().rstrip("\n")
+        n = len(line.split())
+        if current and current_words + n > chunk_size:
+            chunks.append(header + "\n" + "\n".join(current))
+            current, current_words = [], header_words
+        current.append(line)
+        current_words += n
+
+    if current:
+        chunks.append(header + "\n" + "\n".join(current))
+    return chunks
+
+
+SEAM_CHUNK_TARGET_TOKENS = 300  # midpoint of the 200-400 range from the Chroma
+                                 # chunking study cited in the retrieval blueprint
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+\S.*$")
+_MD_PAGE_MARKER_RE = re.compile(r"^<!--\s*Page\s+(\d+)\s*-->\s*$")
+_MD_FENCE_RE = re.compile(r"^\s*```")
+_MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?(\s*:?-{1,}:?\s*\|)+\s*:?-{1,}:?\s*\|?\s*$")
+_MD_TREE_LINE_RE = re.compile(r"[│├└]")  # │ ├ └
+
+
+def _estimate_tokens(s: str) -> int:
+    """~4 chars per token, a conservative estimate. The one estimator for
+    this heuristic in the module — also used by `_split_by_token_budget`
+    below, so the markdown-chunking token budget and the embedding-batch
+    token budget can never quietly drift onto two different formulas."""
+    return len(s) // 4 + 1
+
+
+class _MdAtom:
+    """One structurally-indivisible piece of a markdown document: a heading
+    line, a page marker, a whole fenced code block, a whole markdown table,
+    a whole indented tree block, or a plain paragraph. `chunk_markdown` packs
+    these into chunks; it never splits one apart (tables are the one
+    exception - see `_split_md_table`)."""
+    __slots__ = ("kind", "lines", "page")
+
+    def __init__(self, kind: str, lines: List[str], page: Optional[int]):
+        self.kind = kind
+        self.lines = lines
+        self.page = page
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    @property
+    def tokens(self) -> int:
+        return _estimate_tokens(self.text)
+
+
+def _parse_md_atoms(text: str) -> List[_MdAtom]:
+    """Scan a markdown document into an ordered list of atoms, tracking the
+    most recent `<!-- Page N -->` marker so every atom carries the page it
+    belongs to (None until the first marker is seen)."""
+    lines = text.split("\n")
+    n = len(lines)
+    atoms: List[_MdAtom] = []
+    i = 0
+    current_page: Optional[int] = None
+    para_buf: List[str] = []
+
+    def flush_paragraph() -> None:
+        if para_buf:
+            atoms.append(_MdAtom("paragraph", para_buf[:], current_page))
+            para_buf.clear()
+
+    while i < n:
+        line = lines[i]
+
+        # Fenced code block - swallowed whole, including the fence markers.
+        # An unclosed fence at EOF still ends here (better than silently
+        # absorbing the rest of the document).
+        if _MD_FENCE_RE.match(line):
+            flush_paragraph()
+            fence_lines = [line]
+            i += 1
+            while i < n and not _MD_FENCE_RE.match(lines[i]):
+                fence_lines.append(lines[i])
+                i += 1
+            if i < n:
+                fence_lines.append(lines[i])
+                i += 1
+            atoms.append(_MdAtom("fence", fence_lines, current_page))
+            continue
+
+        # Page marker - a seam, and it updates the page context for
+        # everything that follows.
+        m = _MD_PAGE_MARKER_RE.match(line)
+        if m:
+            flush_paragraph()
+            current_page = int(m.group(1))
+            atoms.append(_MdAtom("marker", [line], current_page))
+            i += 1
+            continue
+
+        # Heading - a seam.
+        if _MD_HEADING_RE.match(line):
+            flush_paragraph()
+            atoms.append(_MdAtom("heading", [line], current_page))
+            i += 1
+            continue
+
+        # Markdown table: a row line immediately followed by a `|---|---|`
+        # separator line. Consume every contiguous row line after that.
+        if _MD_TABLE_ROW_RE.match(line) and i + 1 < n and _MD_TABLE_SEP_RE.match(lines[i + 1]):
+            flush_paragraph()
+            table_lines = [line, lines[i + 1]]
+            i += 2
+            while i < n and _MD_TABLE_ROW_RE.match(lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            atoms.append(_MdAtom("table", table_lines, current_page))
+            continue
+
+        # Indented tree block (the board-hierarchy shape: "├─"/"└─"/"│").
+        # Pulls in one immediately-preceding non-blank "root" line (e.g. a
+        # bare board name with no tree glyph of its own), then absorbs every
+        # contiguous non-blank line until a blank line or another seam.
+        if _MD_TREE_LINE_RE.search(line):
+            tree_lines: List[str] = []
+            if para_buf and para_buf[-1].strip() != "":
+                tree_lines.append(para_buf.pop())
+            flush_paragraph()
+            tree_lines.append(line)
+            i += 1
+            while (i < n and lines[i].strip() != ""
+                   and not _MD_HEADING_RE.match(lines[i])
+                   and not _MD_PAGE_MARKER_RE.match(lines[i])
+                   and not _MD_FENCE_RE.match(lines[i])):
+                tree_lines.append(lines[i])
+                i += 1
+            atoms.append(_MdAtom("tree", tree_lines, current_page))
+            continue
+
+        para_buf.append(line)
+        i += 1
+
+    flush_paragraph()
+    return atoms
+
+
+def _split_md_table(atom: _MdAtom, chunk_size: int) -> List[str]:
+    """Split an oversized table on row boundaries, repeating the header +
+    separator row in every piece - the same precedent chunk_csv already sets
+    for CSV files, applied here to a markdown table instead."""
+    header_lines = atom.lines[:2]
+    data_lines = atom.lines[2:]
+    header_text = "\n".join(header_lines)
+    header_tokens = _estimate_tokens(header_text)
+
+    groups: List[str] = []
+    current: List[str] = []
+    current_tokens = header_tokens
+    for row in data_lines:
+        row_tokens = _estimate_tokens(row)
+        if current and current_tokens + row_tokens > chunk_size:
+            groups.append(header_text + "\n" + "\n".join(current))
+            current, current_tokens = [], header_tokens
+        current.append(row)
+        current_tokens += row_tokens
+    if current:
+        groups.append(header_text + "\n" + "\n".join(current))
+    return groups if groups else [atom.text]
+
+
+def chunk_markdown(
+    text: str, file_name: str = "", chunk_size: int = SEAM_CHUNK_TARGET_TOKENS,
+) -> List[Tuple[str, Optional[int], Optional[int]]]:
+    """Chunk a markdown document on structural seams instead of blind
+    word-count windows.
+
+    Splits on headings (`#`..`######`) and `<!-- Page N -->` markers. Never
+    cuts a markdown table, a fenced code block, or an indented tree block
+    (the board-hierarchy shape using box-drawing glyphs) mid-structure - a
+    table that alone exceeds `chunk_size` is the one exception, split on row
+    boundaries with its header repeated (`_split_md_table`, mirroring
+    `chunk_csv`). `chunk_size` is a token budget (chars/4 estimate, same
+    heuristic as `_split_by_token_budget`); the default targets the
+    200-400 token range the Chroma chunking study found reduces context
+    dilution, versus the previous blind 500-*word* windows.
+
+    Returns a list of (chunk_text, page_start, page_end) tuples so callers
+    can carry real page numbers instead of guessing. `file_name` is accepted
+    for parity with the other chunkers' call shape; nothing here depends on
+    it today.
+
+    Falls back to the existing word-window splitter (as (chunk, None, None)
+    tuples) when the text has no discoverable heading, page marker, table,
+    fence, or tree - i.e. plain prose, where seam-awareness has nothing to
+    seam on.
+    """
+    atoms = _parse_md_atoms(text)
+    if not atoms:
+        return []
+
+    has_seam = any(a.kind in ("heading", "marker") for a in atoms)
+    has_structure = any(a.kind in ("table", "fence", "tree") for a in atoms)
+    if not has_seam and not has_structure:
+        return [(c, None, None) for c in chunk_text(text, chunk_size=chunk_size, overlap=50)]
+
+    # A seam only forces a chunk break once the current chunk already holds
+    # "enough" (soft_min); a non-seam atom only forces one once the current
+    # chunk is already over budget (soft_max). Both are deliberately loose -
+    # the goal is roughly-sized chunks aligned to seams, not exact sizing.
+    soft_min = chunk_size * 0.6
+    soft_max = chunk_size * 1.3
+
+    chunks: List[Tuple[str, Optional[int], Optional[int]]] = []
+    cur_atoms: List[_MdAtom] = []
+    cur_tokens = 0
+
+    def cur_page_range() -> Tuple[Optional[int], Optional[int]]:
+        pages = [a.page for a in cur_atoms if a.page is not None]
+        return (min(pages), max(pages)) if pages else (None, None)
+
+    def flush() -> None:
+        nonlocal cur_atoms, cur_tokens
+        if not cur_atoms:
+            return
+        chunk_text_out = "\n".join(a.text for a in cur_atoms)
+        p_start, p_end = cur_page_range()
+        chunks.append((chunk_text_out, p_start, p_end))
+        cur_atoms = []
+        cur_tokens = 0
+
+    for atom in atoms:
+        is_seam = atom.kind in ("heading", "marker")
+
+        if atom.kind == "table" and atom.tokens > chunk_size * 1.2:
+            # Oversized table: never merged with neighbours, split on rows
+            # instead (see _split_md_table's docstring for the precedent).
+            flush()
+            for sub in _split_md_table(atom, chunk_size):
+                chunks.append((sub, atom.page, atom.page))
+            continue
+
+        atom_tokens = atom.tokens
+
+        if is_seam:
+            if cur_atoms and cur_tokens >= soft_min:
+                flush()
+            cur_atoms.append(atom)
+            cur_tokens += atom_tokens
+            continue
+
+        # Never flush a chunk that is still just a bare heading/marker with
+        # no real content yet - that would ship an orphaned header with
+        # nothing to describe. The first real atom always joins it, even if
+        # that pushes the chunk over soft_max.
+        cur_has_content = any(a.kind not in ("heading", "marker") for a in cur_atoms)
+        if cur_atoms and cur_has_content and (cur_tokens + atom_tokens) > soft_max:
+            flush()
+        cur_atoms.append(atom)
+        cur_tokens += atom_tokens
+
+    flush()
+    return chunks
+
+
+def chunk_document(text: str, file_name: str = "", chunk_size: int = 500,
+                   overlap: int = 50) -> List[str]:
+    """Pick the chunker that suits the file, falling back to the word splitter."""
+    ext = os.path.splitext(file_name or "")[1].lower()
+    if ext == ".csv":
+        rows = chunk_csv(text, chunk_size=chunk_size)
+        if rows:
+            return rows
+    elif ext == ".md" and retrieval_flags.flag("seam_chunks"):
+        seam_chunks = chunk_markdown(text, file_name)
+        if seam_chunks:
+            return [c for c, _page_start, _page_end in seam_chunks]
+    return chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+
+
+IDENTITY_HEADER_MAX_LEN = 120
+_PAGE_COLUMN_NAMES = {"source_page", "page", "page_no", "page_number"}
+
+
+def identity_header(
+    doc_title: str | None = None,
+    file_name: str | None = None,
+    section: str | None = None,
+    page_start: int | None = None,
+    page_end: int | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Build the `[...]` identity line prepended to a chunk's content when
+    retrieval_flags.flag("chunk_identity") is on.
+
+    Shape: `[<doc_title> · <file_name> · <section> · p<page> · tags: ...]`.
+    Pure — same inputs always produce the same string; no clock, no
+    randomness, no I/O. A field that is None/empty is left out entirely
+    rather than leaving a bare ` · ` separator behind.
+    """
+    parts: list[str] = []
+    if doc_title:
+        parts.append(str(doc_title))
+    if file_name:
+        parts.append(str(file_name))
+    if section:
+        parts.append(str(section))
+
+    if page_start is not None and page_end is not None and page_start != page_end:
+        parts.append(f"p{page_start}-{page_end}")
+    elif page_start is not None:
+        parts.append(f"p{page_start}")
+    elif page_end is not None:
+        parts.append(f"p{page_end}")
+
+    if tags:
+        parts.append("tags: " + ", ".join(str(t) for t in tags))
+
+    header = "[" + " · ".join(parts) + "]"
+    if len(header) > IDENTITY_HEADER_MAX_LEN:
+        # Defensive cap only — realistic corpus headers land near 100 chars
+        # and never hit this. Keeps the ≤120-char contract even for a
+        # pathological file_name/tags combination.
+        header = header[: IDENTITY_HEADER_MAX_LEN - 1].rstrip(" ·") + "]"
+    return header
+
+
+def _humanize(segment: str) -> str:
+    """'hwu_om_firefighting' -> 'Hwu Om Firefighting'. Pure string transform,
+    no project-specific knowledge — used to turn a path/file segment into a
+    human-readable label for the identity header."""
+    words = re.sub(r"[_\-]+", " ", segment).split()
+    return " ".join(w.capitalize() for w in words)
+
+
+def _derive_doc_title(folder_path: str | None, file_name: str) -> str | None:
+    """One folder = one logical document (doc-prep convention: 'One folder
+    per source document'), so the folder name is the stable identity shared
+    by every chunk of every file inside it — unlike file_name, which only
+    identifies the one CSV/markdown file within that document. Falls back to
+    the file's own name when there is no folder (root, or folder_path
+    unknown).
+
+    Deliberately NOT derived from LLM-extracted metadata (e.g. the 'topic'
+    field): that call can return different wording on different ingests of
+    the same file, which would make the embedded identity string — and
+    therefore the embedding itself — silently non-reproducible run to run.
+    """
+    if folder_path and folder_path.strip("/"):
+        segment = folder_path.rstrip("/").rsplit("/", 1)[-1]
+        if segment:
+            return _humanize(segment)
+    stem = os.path.splitext(file_name or "")[0]
+    return _humanize(stem) if stem else None
+
+
+def _csv_chunk_page_range(chunk_text: str) -> tuple[int | None, int | None]:
+    """Best-effort (min, max) page numbers for a CSV row-chunk, read from a
+    'source_page'-shaped column repeated in the chunk's own header row
+    (chunk_csv() repeats the header in every chunk — see its docstring).
+    Pure — parses only the given string, no filesystem/network access.
+    Returns (None, None) when the chunk doesn't parse as a header+rows CSV or
+    carries no recognisable page column, so callers can omit the page
+    segment of the identity header cleanly instead of guessing."""
+    try:
+        rows = list(csv.reader(io.StringIO(chunk_text)))
+    except (csv.Error, ValueError):
+        return (None, None)
+    if len(rows) < 2:
+        return (None, None)
+
+    header = rows[0]
+    page_idx = None
+    for i, col in enumerate(header):
+        if (col or "").strip().lower() in _PAGE_COLUMN_NAMES:
+            page_idx = i
+            break
+    if page_idx is None:
+        return (None, None)
+
+    pages = []
+    for row in rows[1:]:
+        if page_idx < len(row):
+            val = (row[page_idx] or "").strip()
+            if val.isdigit():
+                pages.append(int(val))
+    if not pages:
+        return (None, None)
+    return (min(pages), max(pages))
+
+
 def _is_rate_limit_error(e: Exception) -> bool:
     """Check if an exception is a 429 rate limit error."""
     err_str = str(e)
@@ -180,11 +615,22 @@ def _embed_with_retry(func, *args, max_retries: int = 5, **kwargs):
             time.sleep(wait)
 
 
-def embed_text(text: str) -> List[float]:
+def embed_text(text: str, task_type: str = TASK_TYPE_DOCUMENT, title: str | None = None) -> List[float]:
+    """Embed one string. Defaults to DOCUMENT — callers embedding a user's question
+    must pass TASK_TYPE_QUERY.
+
+    `title` is Gemini's per-document identity hint (gemini-embedding-001, docs say
+    it improves retrieval quality). It is only valid for RETRIEVAL_DOCUMENT, so it
+    is silently dropped for any other task_type instead of being sent and risking
+    an API-side rejection or no-op. Omitted (None) reproduces today's request
+    exactly — this is what keeps chunk_identity's flag-off path byte-identical."""
+    config = {"output_dimensionality": EMBEDDING_DIMS, "task_type": task_type}
+    if title and task_type == TASK_TYPE_DOCUMENT:
+        config["title"] = title
     response = _embed_with_retry(
         _client.models.embed_content,
         model=EMBEDDING_MODEL, contents=text,
-        config={"output_dimensionality": EMBEDDING_DIMS},
+        config=config,
     )
     return response.embeddings[0].values
 
@@ -196,7 +642,7 @@ def _split_by_token_budget(texts: List[str], max_tokens: int = 18000, max_items:
     current_batch = []
     current_tokens = 0
     for text in texts:
-        est_tokens = len(text) // 4 + 1
+        est_tokens = _estimate_tokens(text)
         if current_batch and (current_tokens + est_tokens > max_tokens or len(current_batch) >= max_items):
             batches.append(current_batch)
             current_batch = []
@@ -208,22 +654,30 @@ def _split_by_token_budget(texts: List[str], max_tokens: int = 18000, max_items:
     return batches
 
 
-def embed_batch(texts: List[str], batch_size: int = 50) -> List[List[float]]:
+def embed_batch(texts: List[str], batch_size: int = 50, title: str | None = None) -> List[List[float]]:
+    """Embed a batch of DOCUMENT-side texts. `title` (optional) is passed to Gemini
+    once per batch call, which is correct as long as every text in one embed_batch()
+    call belongs to the same source document — true for every current caller
+    (ingest_document / ingest_document_update process one file at a time).
+    Omitted by default, so existing callers (reembed_all.py etc.) are unaffected."""
     if not texts:
         return []
     all_embeddings = []
     batches = _split_by_token_budget(texts, max_tokens=18000, max_items=batch_size)
     for idx, batch in enumerate(batches):
         try:
+            config = {"output_dimensionality": EMBEDDING_DIMS, "task_type": TASK_TYPE_DOCUMENT}
+            if title:
+                config["title"] = title
             response = _embed_with_retry(
                 _client.models.embed_content,
                 model=EMBEDDING_MODEL, contents=batch,
-                config={"output_dimensionality": EMBEDDING_DIMS},
+                config=config,
             )
             all_embeddings.extend([e.values for e in response.embeddings])
         except Exception:
             # Fallback: embed one at a time for this batch
-            all_embeddings.extend([embed_text(t) for t in batch])
+            all_embeddings.extend([embed_text(t, TASK_TYPE_DOCUMENT, title=title) for t in batch])
         # Rate-limit pause between batches to avoid 429 errors
         if idx < len(batches) - 1:
             time.sleep(1)
@@ -379,6 +833,75 @@ def _extract_structured_data(
         logger.info(f"Stored structured data '{table_name}' ({len(clean_rows)} rows) for document {document_id}")
 
 
+def _embed_and_build_chunk_rows(
+    chunks: List[str], document_id: str, user_id: str, file_name: str, folder_path: str | None,
+) -> List[dict]:
+    """Embed `chunks` and build the document_chunks row dicts to insert.
+
+    Shared by ingest_document and ingest_document_update so the two ingest
+    paths cannot diverge (both must apply chunk_identity identically).
+
+    Flag OFF: reproduces pre-chunk_identity behaviour byte-for-byte — same
+    `content`, same embed_content config (no `title`), no identity columns
+    populated. This is the guard the flag-off test asserts.
+    """
+    if not retrieval_flags.flag("chunk_identity"):
+        embeddings = embed_batch(chunks)
+        return [
+            {
+                "document_id": document_id,
+                "user_id": user_id,
+                "content": chunk,
+                "embedding": embedding,
+                "chunk_index": idx,
+                "content_hash": compute_chunk_hash(chunk),
+            }
+            for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+        ]
+
+    doc_title = _derive_doc_title(folder_path, file_name)
+    stamped_chunks: List[str] = []
+    page_ranges: List[tuple] = []
+    for chunk in chunks:
+        page_start, page_end = _csv_chunk_page_range(chunk)
+        header = identity_header(
+            doc_title=doc_title, file_name=file_name, section=None,
+            page_start=page_start, page_end=page_end, tags=None,
+        )
+        stamped_chunks.append(f"{header}\n{chunk}")
+        page_ranges.append((page_start, page_end))
+
+    embeddings = embed_batch(stamped_chunks, title=doc_title)
+
+    return [
+        {
+            "document_id": document_id,
+            "user_id": user_id,
+            "content": stamped,
+            "embedding": embedding,
+            "chunk_index": idx,
+            "content_hash": compute_chunk_hash(stamped),
+            "file_name": file_name,
+            "folder_path": folder_path,
+            "doc_title": doc_title,
+            "page_start": page_ranges[idx][0],
+            "page_end": page_ranges[idx][1],
+            "section_path": None,
+            "tags": None,
+        }
+        for idx, (stamped, embedding) in enumerate(zip(stamped_chunks, embeddings))
+    ]
+
+
+def _folder_path_for(document_id: str, supabase_client) -> str | None:
+    """One extra SELECT, made only when chunk_identity is on — folder_path is
+    not part of ingest_document's own parameters (both call sites insert the
+    documents row, with folder_path, before calling ingest_document)."""
+    row = supabase_client.table("documents").select("folder_path").eq(
+        "id", document_id).single().execute().data or {}
+    return row.get("folder_path")
+
+
 def ingest_document(
     document_id: str,
     file_content: bytes,
@@ -413,23 +936,15 @@ def ingest_document(
         except Exception as e:
             logger.warning(f"Structured data extraction failed (non-fatal) for {document_id}: {e}")
 
-        chunks = chunk_text(text, chunk_size=500, overlap=50)
+        chunks = chunk_document(text, file_name, chunk_size=500, overlap=50)
         if not chunks:
             raise ValueError("Chunking produced no chunks")
 
-        embeddings = embed_batch(chunks)
-
-        rows = [
-            {
-                "document_id": document_id,
-                "user_id": user_id,
-                "content": chunk,
-                "embedding": embedding,
-                "chunk_index": idx,
-                "content_hash": compute_chunk_hash(chunk),
-            }
-            for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-        ]
+        folder_path = (
+            _folder_path_for(document_id, supabase_client)
+            if retrieval_flags.flag("chunk_identity") else None
+        )
+        rows = _embed_and_build_chunk_rows(chunks, document_id, user_id, file_name, folder_path)
         for i in range(0, len(rows), 100):
             supabase_client.table("document_chunks").insert(rows[i : i + 100]).execute()
 
@@ -499,23 +1014,15 @@ def ingest_document_update(
         except Exception as e:
             logger.warning(f"Structured data extraction failed (non-fatal) for {document_id}: {e}")
 
-        chunks = chunk_text(text, chunk_size=500, overlap=50)
+        chunks = chunk_document(text, file_name, chunk_size=500, overlap=50)
         if not chunks:
             raise ValueError("Chunking produced no chunks")
 
-        embeddings = embed_batch(chunks)
-
-        rows = [
-            {
-                "document_id": document_id,
-                "user_id": user_id,
-                "content": chunk,
-                "embedding": embedding,
-                "chunk_index": idx,
-                "content_hash": compute_chunk_hash(chunk),
-            }
-            for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-        ]
+        folder_path = (
+            _folder_path_for(document_id, supabase_client)
+            if retrieval_flags.flag("chunk_identity") else None
+        )
+        rows = _embed_and_build_chunk_rows(chunks, document_id, user_id, file_name, folder_path)
         for i in range(0, len(rows), 100):
             supabase_client.table("document_chunks").insert(rows[i:i+100]).execute()
 

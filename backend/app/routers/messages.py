@@ -79,7 +79,7 @@ async def send_message(
             supabase.table("structured_data")
             .select("table_name,columns")
             .eq("user_id", user_id)
-            .limit(20)
+            .order("table_name")
             .execute()
         )
         has_structured_data = bool(struct_data.data)
