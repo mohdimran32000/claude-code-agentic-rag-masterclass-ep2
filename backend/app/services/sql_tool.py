@@ -12,7 +12,6 @@ from google import genai
 from google.genai import types as genai_types
 from langsmith import traceable
 
-from app.services import retrieval_flags
 from app.services.settings import get_llm_api_key, get_llm_model
 from app.services.table_router import select_tables
 
@@ -140,26 +139,25 @@ def execute_sql_query(question: str, user_id: str, supabase_client) -> str:
     if not tables:
         return "No tabular data found. Upload a CSV or XLSX file first."
 
-    # 1b. Router (flagged, default OFF): narrow `tables` to the few this
-    # question needs, plus their declared join neighbours, before building
-    # the schema block or loading DuckDB. This is the only place the router
-    # touches this function — with the flag off, `tables` is exactly what
-    # it was before this stage existed (same rows, same order from the
-    # `.order("table_name")` fetch above), so the flag-off schema block is
-    # byte-identical to pre-router behaviour.
-    if retrieval_flags.flag("table_router"):
-        cards = _load_table_cards()
-        if cards:
-            selected = set(select_tables(question, cards, k=3))
-            filtered = [t for t in tables if t["table_name"] in selected]
-            if filtered:
-                logger.info(f"table_router: {len(tables)} tables -> "
-                            f"{[t['table_name'] for t in filtered]}")
-                tables = filtered
-            else:
-                logger.warning("table_router: selection matched no live tables "
-                                "(cards out of sync with structured_data?); "
-                                "falling back to the full schema for this question")
+    # 1b. Router: narrow `tables` to the few this question needs, plus their
+    # declared join neighbours, before building the schema block or loading
+    # DuckDB. SHIPPED 2026-08-29/30 (see RETRIEVAL-VERDICTS.md #3) —
+    # unconditional, no flag. If no cards are loaded (missing/corrupt file),
+    # or the selection matches nothing live, this falls back to the full
+    # unrouted `tables` list — that fallback is a real safety net, not
+    # experiment scaffolding, and stays.
+    cards = _load_table_cards()
+    if cards:
+        selected = set(select_tables(question, cards, k=3))
+        filtered = [t for t in tables if t["table_name"] in selected]
+        if filtered:
+            logger.info(f"table_router: {len(tables)} tables -> "
+                        f"{[t['table_name'] for t in filtered]}")
+            tables = filtered
+        else:
+            logger.warning("table_router: selection matched no live tables "
+                            "(cards out of sync with structured_data?); "
+                            "falling back to the full schema for this question")
 
     # 2. Build schema description for LLM
     # For wide tables (>30 cols), include sample rows so the LLM can understand the structure
