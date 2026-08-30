@@ -5,17 +5,43 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 
 import duckdb
 from google import genai
 from google.genai import types as genai_types
 from langsmith import traceable
 
+from app.services import retrieval_flags
 from app.services.settings import get_llm_api_key, get_llm_model
+from app.services.table_router import select_tables
 
 logger = logging.getLogger(__name__)
 
 SQL_QUERY_TIMEOUT = 5  # seconds
+
+# doc-prep is a sibling of this repo under the same parent folder — see
+# doc-prep/CLAUDE.md and doc-prep/11_table_cards.py. Cards are generated
+# there (deterministically, from verified manifests) and read here only
+# when RETRIEVAL_TABLE_ROUTER is on; a missing file degrades to the
+# unrouted (flag-off) behaviour rather than raising, so a doc-prep-side
+# checkout problem can never take the SQL tool down in production.
+_TABLE_CARDS_PATH = (
+    Path(__file__).resolve().parents[5] / "doc-prep" / "eval" / "table_cards.json"
+)
+_table_cards_cache = None
+
+
+def _load_table_cards() -> list[dict]:
+    global _table_cards_cache
+    if _table_cards_cache is None:
+        try:
+            _table_cards_cache = json.loads(_TABLE_CARDS_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning(f"table_router: could not load {_TABLE_CARDS_PATH} ({e}); "
+                            f"falling back to the unrouted schema block")
+            _table_cards_cache = []
+    return _table_cards_cache
 
 
 def _infer_column_types(cols: list, rows: list, sample_limit: int = 200) -> dict:
@@ -114,6 +140,27 @@ def execute_sql_query(question: str, user_id: str, supabase_client) -> str:
     if not tables:
         return "No tabular data found. Upload a CSV or XLSX file first."
 
+    # 1b. Router (flagged, default OFF): narrow `tables` to the few this
+    # question needs, plus their declared join neighbours, before building
+    # the schema block or loading DuckDB. This is the only place the router
+    # touches this function — with the flag off, `tables` is exactly what
+    # it was before this stage existed (same rows, same order from the
+    # `.order("table_name")` fetch above), so the flag-off schema block is
+    # byte-identical to pre-router behaviour.
+    if retrieval_flags.flag("table_router"):
+        cards = _load_table_cards()
+        if cards:
+            selected = set(select_tables(question, cards, k=3))
+            filtered = [t for t in tables if t["table_name"] in selected]
+            if filtered:
+                logger.info(f"table_router: {len(tables)} tables -> "
+                            f"{[t['table_name'] for t in filtered]}")
+                tables = filtered
+            else:
+                logger.warning("table_router: selection matched no live tables "
+                                "(cards out of sync with structured_data?); "
+                                "falling back to the full schema for this question")
+
     # 2. Build schema description for LLM
     # For wide tables (>30 cols), include sample rows so the LLM can understand the structure
     MAX_COLS_DETAILED = 30
@@ -153,6 +200,37 @@ def execute_sql_query(question: str, user_id: str, supabase_client) -> str:
                     else:
                         col_descs.append(f"  {c} (text; many distinct values, examples: {sample_str})")
             schema_desc += f"\nTable: {t['table_name']} ({t['row_count']} rows)\nColumns:\n" + "\n".join(col_descs) + "\n"
+
+    # 2b. Disambiguate a current/pre-takeover table pair when BOTH are in
+    # play. Found as a real regression while building the table router
+    # (doc-prep task 8): with all 28 tables always present, the model
+    # rarely confused 'hwu_panels' (current) with 'hwu_existing_panels'
+    # (pre-takeover, per the manifest's own 'status' column values —
+    # current/existing/backfilled) for a plain present-tense question. With
+    # the router narrowing the schema block to a handful of tables, the two
+    # near-identical schemas sit right next to each other with nothing else
+    # to anchor against, and 6 of 33 eval_rag_vs_truth.py cases flipped to
+    # the wrong (historical) table in one run. This note is cheap (~40
+    # tokens per pair) and unconditional — it fixes a latent ambiguity in
+    # the corpus itself, not something specific to the router, so it stays
+    # on regardless of RETRIEVAL_TABLE_ROUTER.
+    existing_pairs = []
+    live_names = {t["table_name"] for t in tables}
+    for t in tables:
+        name = t["table_name"]
+        if "_existing_" in name:
+            current_name = name.replace("existing_", "", 1)
+            if current_name in live_names:
+                existing_pairs.append((name, current_name))
+    existing_note = ""
+    if existing_pairs:
+        pairs_str = "; ".join(f'"{old}" is the PRE-TAKEOVER/historical counterpart of "{new}"'
+                               for old, new in existing_pairs)
+        existing_note = (
+            f"\n- {pairs_str}. For a plain present-tense question that does NOT say "
+            f"'existing', 'before', 'pre-takeover', 'original' or 'historical', use ONLY "
+            f"the current table — never the historical one, even if both are listed above."
+        )
 
     # 3. Use Gemini to generate DuckDB SQL
     # 3-minute request timeout — a wedged HTTP connection otherwise hangs the
@@ -234,7 +312,7 @@ Rules:
 - For text comparisons use ILIKE for case-insensitive matching
 - Match the FORMAT of the column samples — e.g. if floor values look like 'GF', '4F', '6F' then the 4th floor is floor = '4F' (never '%4th%' or 'fourth')
 - Columns marked 'possible values' list the complete set — filter with those exact values. Columns marked 'examples' have MANY OTHER values — if the user's term (e.g. 'FCU') is not among the examples, still filter for it directly with ILIKE '%term%'; NEVER substitute a different example value for the user's term
-- Tables often reference each other by shared identifier values (e.g. a board/panel name column in one table matching a name column in another) — use JOINs across tables when a question spans them
+- Tables often reference each other by shared identifier values (e.g. a board/panel name column in one table matching a name column in another) — use JOINs across tables when a question spans them{existing_note}
 - NEVER infer a panel's block or floor from its NAME pattern (db ILIKE '%-4F-%' silently returns 0 rows — naming schemes vary, e.g. 'DB-04(B)-SP-01' is a 4th-floor Block B board). Resolve block/floor filters through the panel-schedule table's own block and floor columns: WHERE db IN (SELECT panel FROM "panels" WHERE block = 'B' AND floor = '4F')
 - NEVER drop a constraint from the question. If the user names an equipment/load type (e.g. 'FCU'), the WHERE clause MUST filter on it (e.g. load_type ILIKE '%FCU%') IN ADDITION TO any floor/block/area filters — a floor filter alone returns every load type on that floor, which is wrong
 - When counting equipment/units and the table has a quantity column (e.g. 'points', 'qty', 'count'), SUM that column instead of COUNT(*) — one row can represent multiple units
