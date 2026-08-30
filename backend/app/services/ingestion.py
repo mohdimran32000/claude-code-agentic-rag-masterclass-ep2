@@ -10,7 +10,7 @@ import logging
 import re
 import tempfile
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 from google import genai
 
@@ -217,13 +217,266 @@ def chunk_csv(text: str, chunk_size: int = 500) -> List[str]:
     return chunks
 
 
+SEAM_CHUNK_TARGET_TOKENS = 300  # midpoint of the 200-400 range from the Chroma
+                                 # chunking study cited in the retrieval blueprint
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+\S.*$")
+_MD_PAGE_MARKER_RE = re.compile(r"^<!--\s*Page\s+(\d+)\s*-->\s*$")
+_MD_FENCE_RE = re.compile(r"^\s*```")
+_MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?(\s*:?-{1,}:?\s*\|)+\s*:?-{1,}:?\s*\|?\s*$")
+_MD_TREE_LINE_RE = re.compile(r"[│├└]")  # │ ├ └
+
+
+def _md_estimate_tokens(s: str) -> int:
+    """Same chars/4 heuristic already used by _split_by_token_budget - kept
+    consistent rather than introducing a second estimator."""
+    return len(s) // 4 + 1
+
+
+class _MdAtom:
+    """One structurally-indivisible piece of a markdown document: a heading
+    line, a page marker, a whole fenced code block, a whole markdown table,
+    a whole indented tree block, or a plain paragraph. `chunk_markdown` packs
+    these into chunks; it never splits one apart (tables are the one
+    exception - see `_split_md_table`)."""
+    __slots__ = ("kind", "lines", "page")
+
+    def __init__(self, kind: str, lines: List[str], page: Optional[int]):
+        self.kind = kind
+        self.lines = lines
+        self.page = page
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    @property
+    def tokens(self) -> int:
+        return _md_estimate_tokens(self.text)
+
+
+def _parse_md_atoms(text: str) -> List[_MdAtom]:
+    """Scan a markdown document into an ordered list of atoms, tracking the
+    most recent `<!-- Page N -->` marker so every atom carries the page it
+    belongs to (None until the first marker is seen)."""
+    lines = text.split("\n")
+    n = len(lines)
+    atoms: List[_MdAtom] = []
+    i = 0
+    current_page: Optional[int] = None
+    para_buf: List[str] = []
+
+    def flush_paragraph() -> None:
+        if para_buf:
+            atoms.append(_MdAtom("paragraph", para_buf[:], current_page))
+            para_buf.clear()
+
+    while i < n:
+        line = lines[i]
+
+        # Fenced code block - swallowed whole, including the fence markers.
+        # An unclosed fence at EOF still ends here (better than silently
+        # absorbing the rest of the document).
+        if _MD_FENCE_RE.match(line):
+            flush_paragraph()
+            fence_lines = [line]
+            i += 1
+            while i < n and not _MD_FENCE_RE.match(lines[i]):
+                fence_lines.append(lines[i])
+                i += 1
+            if i < n:
+                fence_lines.append(lines[i])
+                i += 1
+            atoms.append(_MdAtom("fence", fence_lines, current_page))
+            continue
+
+        # Page marker - a seam, and it updates the page context for
+        # everything that follows.
+        m = _MD_PAGE_MARKER_RE.match(line)
+        if m:
+            flush_paragraph()
+            current_page = int(m.group(1))
+            atoms.append(_MdAtom("marker", [line], current_page))
+            i += 1
+            continue
+
+        # Heading - a seam.
+        if _MD_HEADING_RE.match(line):
+            flush_paragraph()
+            atoms.append(_MdAtom("heading", [line], current_page))
+            i += 1
+            continue
+
+        # Markdown table: a row line immediately followed by a `|---|---|`
+        # separator line. Consume every contiguous row line after that.
+        if _MD_TABLE_ROW_RE.match(line) and i + 1 < n and _MD_TABLE_SEP_RE.match(lines[i + 1]):
+            flush_paragraph()
+            table_lines = [line, lines[i + 1]]
+            i += 2
+            while i < n and _MD_TABLE_ROW_RE.match(lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            atoms.append(_MdAtom("table", table_lines, current_page))
+            continue
+
+        # Indented tree block (the board-hierarchy shape: "├─"/"└─"/"│").
+        # Pulls in one immediately-preceding non-blank "root" line (e.g. a
+        # bare board name with no tree glyph of its own), then absorbs every
+        # contiguous non-blank line until a blank line or another seam.
+        if _MD_TREE_LINE_RE.search(line):
+            tree_lines: List[str] = []
+            if para_buf and para_buf[-1].strip() != "":
+                tree_lines.append(para_buf.pop())
+            flush_paragraph()
+            tree_lines.append(line)
+            i += 1
+            while (i < n and lines[i].strip() != ""
+                   and not _MD_HEADING_RE.match(lines[i])
+                   and not _MD_PAGE_MARKER_RE.match(lines[i])
+                   and not _MD_FENCE_RE.match(lines[i])):
+                tree_lines.append(lines[i])
+                i += 1
+            atoms.append(_MdAtom("tree", tree_lines, current_page))
+            continue
+
+        para_buf.append(line)
+        i += 1
+
+    flush_paragraph()
+    return atoms
+
+
+def _split_md_table(atom: _MdAtom, chunk_size: int) -> List[str]:
+    """Split an oversized table on row boundaries, repeating the header +
+    separator row in every piece - the same precedent chunk_csv already sets
+    for CSV files, applied here to a markdown table instead."""
+    header_lines = atom.lines[:2]
+    data_lines = atom.lines[2:]
+    header_text = "\n".join(header_lines)
+    header_tokens = _md_estimate_tokens(header_text)
+
+    groups: List[str] = []
+    current: List[str] = []
+    current_tokens = header_tokens
+    for row in data_lines:
+        row_tokens = _md_estimate_tokens(row)
+        if current and current_tokens + row_tokens > chunk_size:
+            groups.append(header_text + "\n" + "\n".join(current))
+            current, current_tokens = [], header_tokens
+        current.append(row)
+        current_tokens += row_tokens
+    if current:
+        groups.append(header_text + "\n" + "\n".join(current))
+    return groups if groups else [atom.text]
+
+
+def chunk_markdown(
+    text: str, file_name: str = "", chunk_size: int = SEAM_CHUNK_TARGET_TOKENS,
+) -> List[Tuple[str, Optional[int], Optional[int]]]:
+    """Chunk a markdown document on structural seams instead of blind
+    word-count windows.
+
+    Splits on headings (`#`..`######`) and `<!-- Page N -->` markers. Never
+    cuts a markdown table, a fenced code block, or an indented tree block
+    (the board-hierarchy shape using box-drawing glyphs) mid-structure - a
+    table that alone exceeds `chunk_size` is the one exception, split on row
+    boundaries with its header repeated (`_split_md_table`, mirroring
+    `chunk_csv`). `chunk_size` is a token budget (chars/4 estimate, same
+    heuristic as `_split_by_token_budget`); the default targets the
+    200-400 token range the Chroma chunking study found reduces context
+    dilution, versus the previous blind 500-*word* windows.
+
+    Returns a list of (chunk_text, page_start, page_end) tuples so callers
+    can carry real page numbers instead of guessing. `file_name` is accepted
+    for parity with the other chunkers' call shape; nothing here depends on
+    it today.
+
+    Falls back to the existing word-window splitter (as (chunk, None, None)
+    tuples) when the text has no discoverable heading, page marker, table,
+    fence, or tree - i.e. plain prose, where seam-awareness has nothing to
+    seam on.
+    """
+    atoms = _parse_md_atoms(text)
+    if not atoms:
+        return []
+
+    has_seam = any(a.kind in ("heading", "marker") for a in atoms)
+    has_structure = any(a.kind in ("table", "fence", "tree") for a in atoms)
+    if not has_seam and not has_structure:
+        return [(c, None, None) for c in chunk_text(text, chunk_size=chunk_size, overlap=50)]
+
+    # A seam only forces a chunk break once the current chunk already holds
+    # "enough" (soft_min); a non-seam atom only forces one once the current
+    # chunk is already over budget (soft_max). Both are deliberately loose -
+    # the goal is roughly-sized chunks aligned to seams, not exact sizing.
+    soft_min = chunk_size * 0.6
+    soft_max = chunk_size * 1.3
+
+    chunks: List[Tuple[str, Optional[int], Optional[int]]] = []
+    cur_atoms: List[_MdAtom] = []
+    cur_tokens = 0
+
+    def cur_page_range() -> Tuple[Optional[int], Optional[int]]:
+        pages = [a.page for a in cur_atoms if a.page is not None]
+        return (min(pages), max(pages)) if pages else (None, None)
+
+    def flush() -> None:
+        nonlocal cur_atoms, cur_tokens
+        if not cur_atoms:
+            return
+        chunk_text_out = "\n".join(a.text for a in cur_atoms)
+        p_start, p_end = cur_page_range()
+        chunks.append((chunk_text_out, p_start, p_end))
+        cur_atoms = []
+        cur_tokens = 0
+
+    for atom in atoms:
+        is_seam = atom.kind in ("heading", "marker")
+
+        if atom.kind == "table" and atom.tokens > chunk_size * 1.2:
+            # Oversized table: never merged with neighbours, split on rows
+            # instead (see _split_md_table's docstring for the precedent).
+            flush()
+            for sub in _split_md_table(atom, chunk_size):
+                chunks.append((sub, atom.page, atom.page))
+            continue
+
+        atom_tokens = atom.tokens
+
+        if is_seam:
+            if cur_atoms and cur_tokens >= soft_min:
+                flush()
+            cur_atoms.append(atom)
+            cur_tokens += atom_tokens
+            continue
+
+        # Never flush a chunk that is still just a bare heading/marker with
+        # no real content yet - that would ship an orphaned header with
+        # nothing to describe. The first real atom always joins it, even if
+        # that pushes the chunk over soft_max.
+        cur_has_content = any(a.kind not in ("heading", "marker") for a in cur_atoms)
+        if cur_atoms and cur_has_content and (cur_tokens + atom_tokens) > soft_max:
+            flush()
+        cur_atoms.append(atom)
+        cur_tokens += atom_tokens
+
+    flush()
+    return chunks
+
+
 def chunk_document(text: str, file_name: str = "", chunk_size: int = 500,
                    overlap: int = 50) -> List[str]:
     """Pick the chunker that suits the file, falling back to the word splitter."""
-    if os.path.splitext(file_name or "")[1].lower() == ".csv":
+    ext = os.path.splitext(file_name or "")[1].lower()
+    if ext == ".csv":
         rows = chunk_csv(text, chunk_size=chunk_size)
         if rows:
             return rows
+    elif ext == ".md" and retrieval_flags.flag("seam_chunks"):
+        seam_chunks = chunk_markdown(text, file_name)
+        if seam_chunks:
+            return [c for c, _page_start, _page_end in seam_chunks]
     return chunk_text(text, chunk_size=chunk_size, overlap=overlap)
 
 
