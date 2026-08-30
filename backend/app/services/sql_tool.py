@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 
 import duckdb
@@ -18,6 +19,50 @@ from app.services.table_router import select_tables
 logger = logging.getLogger(__name__)
 
 SQL_QUERY_TIMEOUT = 5  # seconds
+
+
+class _QueryTimeoutError(Exception):
+    """Raised when a DuckDB query is aborted for running past SQL_QUERY_TIMEOUT."""
+
+
+def _execute_with_timeout(con, sql, timeout=SQL_QUERY_TIMEOUT):
+    """Run con.execute(sql).fetchall(), aborting it if it runs past `timeout`
+    seconds.
+
+    DuckDB has no built-in query-timeout setting; the documented way to cancel
+    an in-flight query is con.interrupt(), called from another thread while
+    the query thread is blocked inside con.execute(). A threading.Timer does
+    exactly that. The timer is always cancelled in `finally` — win or lose —
+    so nothing is left running after this function returns: on the happy path
+    the timer is cancelled before it would ever fire, and on timeout the timer
+    thread has already finished (it only calls interrupt() once and exits).
+
+    con.interrupt() raises duckdb.InterruptException in the executing thread.
+    That alone doesn't say WHY the query was interrupted, so a `timed_out`
+    flag set inside the timer callback (before calling interrupt) lets us
+    tell "our timeout fired" apart from any other reason a query might be
+    interrupted, and raise a clear, specific message for the former.
+    """
+    timed_out = threading.Event()
+
+    def _abort():
+        timed_out.set()
+        con.interrupt()
+
+    timer = threading.Timer(timeout, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        return con.execute(sql).fetchall()
+    except duckdb.InterruptException:
+        if timed_out.is_set():
+            raise _QueryTimeoutError(
+                f"query exceeded the {timeout}s timeout and was aborted"
+            ) from None
+        raise
+    finally:
+        timer.cancel()
+
 
 # doc-prep is a sibling of this repo under the same parent folder — see
 # doc-prep/CLAUDE.md and doc-prep/11_table_cards.py. Cards are generated
@@ -397,7 +442,13 @@ User question: {question}"""
         # 5. Execute SQL — on failure, give the LLM one shot at repairing the
         # query with the actual error message before falling back
         try:
-            result = con.execute(sql).fetchall()
+            result = _execute_with_timeout(con, sql)
+        except _QueryTimeoutError:
+            # A timeout is a resource problem, not something an LLM repair
+            # prompt can fix — skip the repair round-trip and fail straight
+            # to the outer handler so the request is bounded by
+            # SQL_QUERY_TIMEOUT, not SQL_QUERY_TIMEOUT plus a repair attempt.
+            raise
         except Exception as first_err:
             logger.warning(f"SQL failed ({first_err}), attempting LLM repair")
             repair_prompt = (
@@ -418,7 +469,7 @@ User question: {question}"""
                 sql = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
             sql = _fix_table_names(sql, real_table_names)
             logger.info(f"Repaired SQL: {sql}")
-            result = con.execute(sql).fetchall()
+            result = _execute_with_timeout(con, sql)
         col_names = [desc[0] for desc in con.description]
 
         # 6. Format as markdown table (max 50 rows)
