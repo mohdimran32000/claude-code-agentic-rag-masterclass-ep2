@@ -109,13 +109,25 @@ def _rerank_cohere_scored(query: str, chunks: List[str], top_k: int, attempts: i
     Retry matters because the previous behaviour returned the unranked RRF top-k
     on ANY exception, with a log line and no signal to the caller - so a Cohere
     blip and a good rerank were indistinguishable downstream.
+
+    A 4xx response (bad/expired key, malformed request, exhausted quota) is
+    the one class of failure retrying cannot fix, so it is raised immediately
+    on the first attempt rather than retried — see the `status_code` check
+    below.
     """
     import cohere, time
     api_key = get_cohere_api_key()
     if not api_key:
         logger.warning("Cohere API key not set, skipping reranking")
         return [(c, None) for c in chunks[:top_k]]
-    client = cohere.ClientV2(api_key=api_key)
+    # cohere 7.0.8 defaults to a 300s request timeout AND retries internally,
+    # so with no override here a single hung/rate-limited call plus this
+    # function's own 3 attempts could take ~15 minutes to reach the RRF
+    # fallback below — measured against the owner's exhausted-quota key
+    # (2026-08-29). A short client-side timeout plus max_retries=0 hands ALL
+    # retry policy to the loop below, which (unlike the client) can tell a
+    # transient failure apart from a 4xx that will never succeed.
+    client = cohere.ClientV2(api_key=api_key, timeout=10.0, max_retries=0)
     last = None
     for attempt in range(attempts):
         try:
@@ -124,6 +136,16 @@ def _rerank_cohere_scored(query: str, chunks: List[str], top_k: int, attempts: i
             return [(chunks[r.index], float(r.relevance_score)) for r in resp.results]
         except Exception as e:
             last = e
+            status = getattr(e, "status_code", None)
+            if status is not None and 400 <= status < 500:
+                # Not transient — a bad/expired key (401) or a malformed
+                # request (400) will fail identically on every retry, and an
+                # exhausted quota surfaces as a 4xx too. Fail fast instead of
+                # burning the full retry budget on something retrying can
+                # never fix.
+                logger.warning(f"Cohere rerank failed with {status} (not retrying — "
+                                f"not a transient failure): {e}")
+                raise
             logger.warning(f"Cohere rerank attempt {attempt + 1}/{attempts} failed: {e}")
             if attempt < attempts - 1:
                 time.sleep(2 ** attempt)
