@@ -38,6 +38,10 @@ backend/scripts/results/
 # Private notes (separate private repo — see CLAUDE.md Reference Docs)
 notes/
 
+# Client source drawings (PDF load schedules) — NEVER publish to this public repo
+source-files/
+source-drawings/
+
 # Local dev tooling & personal working notes (machine-specific, not part of the project)
 .claude/agents/
 .claude/commands/gsd/
