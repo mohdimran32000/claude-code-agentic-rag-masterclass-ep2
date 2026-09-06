@@ -245,11 +245,17 @@ def _build_search_tool() -> types.Tool:
 
 
 def _format_structured_tables(structured_tables) -> str:
-    """One-line schema summary per table: name(col1, col2, ...) — capped for prompt size."""
+    """One-line schema summary per table: name(col1, col2, ...) — capped for prompt size.
+
+    Cap raised 20 -> 40 (2026-08-19): the Heriot Watt corpus alone reaches 28 tables, and
+    a table missing from this summary is invisible to the ROUTER — it may never think to
+    call query_structured_data for that topic. execute_sql_query itself has always seen
+    every table, so this only widens the router's awareness, it does not change reach.
+    """
     if not structured_tables:
         return ""
     lines = []
-    for t in structured_tables[:20]:
+    for t in structured_tables[:40]:
         cols = t.get("columns") or []
         col_str = ", ".join(str(c) for c in cols[:15])
         if len(cols) > 15:
@@ -661,10 +667,12 @@ def retrieve_chunks(
     to None — Migration 020's NULL defaults preserve Phase 1/2/3 behavior bit-for-bit
     when omitted.
     """
-    from app.services.ingestion import embed_text
+    from app.services.ingestion import TASK_TYPE_QUERY, embed_text
     from app.services.settings import get_hybrid_search_enabled, get_reranking_enabled
 
-    query_embedding = embed_text(query)
+    # RETRIEVAL_QUERY, not the DOCUMENT default: this is the asking side of the pair.
+    # Must stay matched with how the corpus was embedded (ingestion.TASK_TYPE_DOCUMENT).
+    query_embedding = embed_text(query, TASK_TYPE_QUERY)
     hybrid = get_hybrid_search_enabled()
     reranking = get_reranking_enabled()
 
@@ -1042,10 +1050,14 @@ Document excerpts:
 
     # Use non-streaming generate_content to handle the full tool call loop
     # Then stream the final response to the user
-    response = client.models.generate_content(
+    from app.services.llm_usage import generate_with_usage
+
+    response = generate_with_usage(
+        client,
         model=model,
         contents=contents,
         config=config,
+        name="chat_tool_loop",
     )
 
     # Handle malformed function calls — retry without tools using context injection
