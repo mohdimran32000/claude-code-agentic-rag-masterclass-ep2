@@ -42,30 +42,30 @@ CASES = [
     {
         "q": "how many FCU's connected to 4th floor in Block B?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM db_circuits
+        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM hwu_db_circuits
                         WHERE db IN ('DB-04(B)-SP-01','DB-04(B)-SP-02') AND load_type ILIKE '%FCU%'""",
     },
     {
         "q": "what is the total connected load of the 4th floor in Block B?",
         "kind": "number",
         # Hierarchy: SMDB-B-4F feeds the 4F DBs — only the topmost row counts
-        "truth_sql": """SELECT SUM(TRY_CAST(x.tcl_kw AS DOUBLE)) FROM panels x
+        "truth_sql": """SELECT SUM(TRY_CAST(x.tcl_kw AS DOUBLE)) FROM hwu_panels x
                         WHERE x.block='B' AND x.floor='4F'
-                        AND NOT EXISTS (SELECT 1 FROM panels p WHERE p.panel = x.fed_from
+                        AND NOT EXISTS (SELECT 1 FROM hwu_panels p WHERE p.panel = COALESCE(NULLIF(x.rolls_up_to, ''), x.fed_from)
                                         AND p.block='B' AND p.floor='4F')""",
     },
     {
         "q": "what is the total connected load of Block B?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(x.tcl_kw AS DOUBLE)) FROM panels x
+        "truth_sql": """SELECT SUM(TRY_CAST(x.tcl_kw AS DOUBLE)) FROM hwu_panels x
                         WHERE x.block='B'
-                        AND NOT EXISTS (SELECT 1 FROM panels p WHERE p.panel = x.fed_from
+                        AND NOT EXISTS (SELECT 1 FROM hwu_panels p WHERE p.panel = COALESCE(NULLIF(x.rolls_up_to, ''), x.fed_from)
                                         AND p.block='B')""",
     },
     {
         "q": "what is the incomer rating of DB-04(B)-SP-02?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(incomer_rating_a AS DOUBLE) FROM panels
+        "truth_sql": """SELECT TRY_CAST(incomer_rating_a AS DOUBLE) FROM hwu_panels
                         WHERE panel = 'DB-04(B)-SP-02'""",
     },
     {
@@ -81,66 +81,66 @@ CASES = [
     {
         "q": "how many cleaner socket points are there on the 4th floor of Block B?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM db_circuits
+        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM hwu_db_circuits
                         WHERE db IN ('DB-04(B)-SP-01','DB-04(B)-SP-02') AND remarks ILIKE '%cleaner%'""",
     },
     {
         "q": "what is the total FCU load in watts on the 4th floor of Block B?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(load_w AS DOUBLE)) FROM db_circuits
+        "truth_sql": """SELECT SUM(TRY_CAST(load_w AS DOUBLE)) FROM hwu_db_circuits
                         WHERE db IN ('DB-04(B)-SP-01','DB-04(B)-SP-02') AND load_type ILIKE '%FCU%'""",
     },
     {
         "q": "what is the breaker rating of the feeder from SMDB-B-4F to DB-04(B)-SP-02?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(breaker_a AS DOUBLE) FROM smdb_feeders
+        "truth_sql": """SELECT TRY_CAST(breaker_a AS DOUBLE) FROM hwu_smdb_feeders
                         WHERE smdb='SMDB-B-4F' AND feeder='DB-04(B)-SP-02'""",
     },
     {
         "q": "what is the connected load of the feeder DB-04(B)-SP-01 on SMDB-B-4F?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM smdb_feeders
+        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM hwu_smdb_feeders
                         WHERE smdb='SMDB-B-4F' AND feeder='DB-04(B)-SP-01'""",
     },
     {
         "q": "which SMDB in Block B has the highest total connected load?",
         "kind": "text",
-        "truth_sql": """SELECT panel FROM panels WHERE kind='SMDB' AND block='B'
+        "truth_sql": """SELECT panel FROM hwu_panels WHERE kind='SMDB' AND block='B'
                         ORDER BY TRY_CAST(tcl_kw AS DOUBLE) DESC NULLS LAST LIMIT 1""",
     },
     {
         "q": "what is the total demand load (TDL) for Small Power on MDB-C-G2?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(tdl_kw AS DOUBLE) FROM mdb_calc
+        "truth_sql": """SELECT TRY_CAST(tdl_kw AS DOUBLE) FROM hwu_mdb_calc
                         WHERE mdb='MDB-C-G2' AND load_type ILIKE '%small power%'""",
     },
     {
         "q": "what diversity factor is applied to the Water Heater load on MDB-C-G2?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(diversity AS DOUBLE) FROM mdb_calc
+        "truth_sql": """SELECT TRY_CAST(diversity AS DOUBLE) FROM hwu_mdb_calc
                         WHERE mdb='MDB-C-G2' AND load_type ILIKE '%water heater%'""",
     },
     {
         "q": "how many distribution boards (kind DB) are there in Block C?",
         "kind": "number",
-        "truth_sql": """SELECT COUNT(*) FROM panels WHERE kind='DB' AND block='C'""",
+        "truth_sql": """SELECT COUNT(*) FROM hwu_panels WHERE kind='DB' AND block='C'""",
     },
     {
         "q": "what is the fault level of the MDB-C-G1 feeder from MDB-C?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(fault_ka AS DOUBLE) FROM smdb_feeders
+        "truth_sql": """SELECT TRY_CAST(fault_ka AS DOUBLE) FROM hwu_smdb_feeders
                         WHERE smdb='MDB-C' AND feeder='MDB-C-G1'""",
     },
     {
         "q": "how many lighting points are there in DB-04(B)-LP-02?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM db_circuits
+        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM hwu_db_circuits
                         WHERE db='DB-04(B)-LP-02' AND load_type ILIKE '%LTG%'""",
     },
     {
         "q": "what is the total load in watts of all circuits in DB-04(B)-LP-02?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(load_w AS DOUBLE)) FROM db_circuits
+        "truth_sql": """SELECT SUM(TRY_CAST(load_w AS DOUBLE)) FROM hwu_db_circuits
                         WHERE db='DB-04(B)-LP-02'""",
     },
     {
@@ -151,43 +151,43 @@ CASES = [
     {
         "q": "what is the demand factor of MDB-C?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(demand_factor AS DOUBLE) FROM panels WHERE panel='MDB-C'""",
+        "truth_sql": """SELECT TRY_CAST(demand_factor AS DOUBLE) FROM hwu_panels WHERE panel='MDB-C'""",
     },
     {
         "q": "what is the total connected load of MDB-C?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM panels WHERE panel='MDB-C'""",
+        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM hwu_panels WHERE panel='MDB-C'""",
     },
     {
         "q": "what is the maximum demand load (MDL) of MDB-C?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(mdl_kw AS DOUBLE) FROM panels WHERE panel='MDB-C'""",
+        "truth_sql": """SELECT TRY_CAST(mdl_kw AS DOUBLE) FROM hwu_panels WHERE panel='MDB-C'""",
     },
     {
         "q": "how many cooker circuits are there in total?",
         "kind": "number",
-        "truth_sql": """SELECT COUNT(*) FROM db_circuits WHERE load_type ILIKE '%cooker%'""",
+        "truth_sql": """SELECT COUNT(*) FROM hwu_db_circuits WHERE load_type ILIKE '%cooker%'""",
     },
     {
         # Data-gap regression: SMDB-B-6F was missing from panels (present only on
         # the MDB-C-G2 feeder schedule) — added 2026-07-09 from smdb_feeders
         "q": "what is the total connected load of SMDB-B-6F?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM panels WHERE panel='SMDB-B-6F'""",
+        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM hwu_panels WHERE panel='SMDB-B-6F'""",
     },
     {
         # DEWA-corrected value: printed MDL 1120.40 was struck and replaced with
         # 1156.36 — the ingested mdl_kw holds the current (corrected) value
         "q": "what is the maximum demand of MDB-C-G2?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(mdl_kw AS DOUBLE) FROM panels WHERE panel='MDB-C-G2'""",
+        "truth_sql": """SELECT TRY_CAST(mdl_kw AS DOUBLE) FROM hwu_panels WHERE panel='MDB-C-G2'""",
     },
     # ---- Matrix extension (consistency audit, 2026-07-11) ----
     {
         # Phrasing: typos/informal — same truth as the clean FCU count
         "q": "how many FCU's conected to 4th flor block B",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM db_circuits
+        "truth_sql": """SELECT SUM(TRY_CAST(points AS DOUBLE)) FROM hwu_db_circuits
                         WHERE db IN ('DB-04(B)-SP-01','DB-04(B)-SP-02') AND load_type ILIKE '%FCU%'""",
     },
     {
@@ -205,8 +205,8 @@ CASES = [
         # equipment-type filter must survive alongside the block filter
         "q": "how many FCU points are there in total across all of Block B?",
         "kind": "number",
-        "truth_sql": """SELECT SUM(TRY_CAST(d.points AS DOUBLE)) FROM db_circuits d
-                        JOIN panels p ON d.db = p.panel
+        "truth_sql": """SELECT SUM(TRY_CAST(d.points AS DOUBLE)) FROM hwu_db_circuits d
+                        JOIN hwu_panels p ON d.db = p.panel
                         WHERE p.block='B' AND d.load_type ILIKE '%FCU%'""",
     },
     {
@@ -226,7 +226,7 @@ CASES = [
         # Category: count of panels by kind within a block
         "q": "how many SMDBs are there in Block B?",
         "kind": "number",
-        "truth_sql": """SELECT COUNT(*) FROM panels WHERE kind='SMDB' AND block='B'""",
+        "truth_sql": """SELECT COUNT(*) FROM hwu_panels WHERE kind='SMDB' AND block='B'""",
     },
     {
         # Regression (run 2026-07-12): "max demand of MDB-C-G2" via the router
@@ -235,7 +235,7 @@ CASES = [
         # come from panels, never a SUM over the design-calc breakdown table.
         "q": "what is the total connected load of MDB-C-G2?",
         "kind": "number",
-        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM panels WHERE panel='MDB-C-G2'""",
+        "truth_sql": """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM hwu_panels WHERE panel='MDB-C-G2'""",
     },
     {
         # Category: ambiguous framing — "total load for Block B" legitimately
@@ -245,11 +245,11 @@ CASES = [
         "q": "what is the total load for Block B?",
         "kind": "number_any",
         "accept_sqls": [
-            """SELECT SUM(TRY_CAST(x.tcl_kw AS DOUBLE)) FROM panels x
+            """SELECT SUM(TRY_CAST(x.tcl_kw AS DOUBLE)) FROM hwu_panels x
                WHERE x.block='B'
-               AND NOT EXISTS (SELECT 1 FROM panels p WHERE p.panel = x.fed_from
+               AND NOT EXISTS (SELECT 1 FROM hwu_panels p WHERE p.panel = COALESCE(NULLIF(x.rolls_up_to, ''), x.fed_from)
                                AND p.block='B')""",
-            """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM panels WHERE panel='MDB-C-G2'""",
+            """SELECT TRY_CAST(tcl_kw AS DOUBLE) FROM hwu_panels WHERE panel='MDB-C-G2'""",
         ],
     },
 ]
