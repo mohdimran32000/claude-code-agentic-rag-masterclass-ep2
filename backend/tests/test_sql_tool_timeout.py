@@ -175,7 +175,7 @@ _real_load_cards = sql_tool._load_table_cards
 sql_tool.genai.Client = _FakeGenaiClient
 sql_tool.get_llm_api_key = lambda: "fake-key"
 sql_tool.get_llm_model = lambda: "fake-model"
-sql_tool._load_table_cards = lambda: []  # no router narrowing — deterministic regardless of doc-prep checkout
+sql_tool._load_table_cards = lambda *a, **k: []  # no router narrowing — deterministic regardless of doc-prep checkout
 
 try:
     t0 = time.time()

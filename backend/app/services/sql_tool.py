@@ -4,6 +4,7 @@ Text-to-SQL tool: generates and executes SQL against user's structured data usin
 import json
 import logging
 import os
+import time
 import re
 import threading
 from pathlib import Path
@@ -83,35 +84,106 @@ _DEFAULT_TABLE_CARDS_PATH = Path(__file__).resolve().parent.parent / "data" / "t
 _TABLE_CARDS_PATH = Path(os.environ.get("TABLE_CARDS_PATH", str(_DEFAULT_TABLE_CARDS_PATH)))
 _table_cards_cache = None
 _table_cards_cache_mtime = None
+_table_cards_cache_user = None
+_table_cards_cache_expires = 0.0
+# The cards change only when doc-prep uploads a corpus, so a short TTL is plenty and
+# keeps a per-question database round trip off the hot path. Matches settings.py.
+_TABLE_CARDS_TTL = 60.0
 
 
-def _load_table_cards() -> list[dict]:
-    """Load and cache the router's table cards.
+def _reset_table_cards_cache() -> None:
+    """Drop the cache. Exists for the tests, which must not leak state between cases."""
+    global _table_cards_cache, _table_cards_cache_mtime
+    global _table_cards_cache_user, _table_cards_cache_expires
+    _table_cards_cache = None
+    _table_cards_cache_mtime = None
+    _table_cards_cache_user = None
+    _table_cards_cache_expires = 0.0
 
-    The cache invalidates itself when the file's mtime changes (a freshly
-    regenerated cards file — e.g. after a new doc-prep upload adds a table —
-    is picked up without a process restart; without this, a newly uploaded
-    table could never be routed to, and `_fix_table_names` would keep
-    rewriting references onto a stale table list indefinitely).
 
-    ANY failure to read/parse the file — missing, unreadable, corrupt JSON —
-    degrades to "no cards" (the unrouted, full-schema behaviour) rather than
-    raising, so a broken cards file can never take the SQL tool down.
+def _cards_from_file() -> list[dict]:
+    """The offline fallback: the cards file that used to be the only source.
+
+    Kept so local development and any deployment without the table still work, and so
+    that a database outage degrades to stale-but-useful rather than to nothing.
+    """
+    try:
+        return json.loads(_TABLE_CARDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"table_router: could not load {_TABLE_CARDS_PATH} ({e}); "
+                       f"falling back to the unrouted schema block")
+        return []
+
+
+def _load_table_cards(user_id: str | None = None, supabase_client=None) -> list[dict]:
+    """Load and cache the router's table cards for one user.
+
+    SOURCE OF TRUTH IS THE DATABASE (`table_cards`, migration 025), not the repo.
+    The cards used to live in `backend/app/data/table_cards.json`, and that had three
+    faults, all of them observed on 2026-09-06:
+
+      * the file had never been pushed, so a deploy from git got NO cards and silently
+        ran unrouted — the router worked on exactly one machine;
+      * the committed copy had drifted four tables behind the live corpus, including a
+        167-row camera register, and nothing detected it;
+      * this repository is public and the cards carry sample values from a named client
+        building.
+
+    The file remains as a FALLBACK, in this order: database -> file -> no cards. Every
+    step degrades rather than raising. That is deliberate and load-bearing: `sql_tool`
+    treats "no cards" as the documented full-schema behaviour, so a cards problem must
+    never be able to take the SQL tool down. The fallback matters most exactly when the
+    database is unreachable, which is why the tests cover that case explicitly.
+
+    Cards are scoped per user because what they describe is per user — `execute_sql_query`
+    already filters `structured_data` by user_id, and a router that could see another
+    tenant's tables would be a leak, not a feature.
     """
     global _table_cards_cache, _table_cards_cache_mtime
+    global _table_cards_cache_user, _table_cards_cache_expires
+
+    now = time.time()
     try:
         mtime = _TABLE_CARDS_PATH.stat().st_mtime
     except OSError:
         mtime = None
-    if _table_cards_cache is None or mtime != _table_cards_cache_mtime:
+
+    fresh = (_table_cards_cache is not None
+             and _table_cards_cache_user == user_id
+             and now < _table_cards_cache_expires
+             and mtime == _table_cards_cache_mtime)
+    if fresh:
+        return _table_cards_cache
+
+    cards: list[dict] = []
+    if user_id and supabase_client is not None:
         try:
-            _table_cards_cache = json.loads(_TABLE_CARDS_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning(f"table_router: could not load {_TABLE_CARDS_PATH} ({e}); "
-                            f"falling back to the unrouted schema block")
-            _table_cards_cache = []
-        _table_cards_cache_mtime = mtime
-    return _table_cards_cache
+            res = (supabase_client.table("table_cards")
+                   .select("table_name, card")
+                   .eq("user_id", user_id)
+                   .execute())
+            rows = getattr(res, "data", None) or []
+            # A row whose `card` is not an object is skipped rather than fatal: the
+            # router's own guard would survive it, but failing here would defeat the
+            # point of the fallback chain.
+            cards = [r["card"] for r in rows
+                     if isinstance(r, dict) and isinstance(r.get("card"), dict)]
+            if rows and not cards:
+                logger.warning("table_router: table_cards rows present but none parsed "
+                               "as card objects; falling back to the local file")
+        except Exception as e:
+            logger.warning(f"table_router: could not read table_cards from the database "
+                           f"({type(e).__name__}: {e}); falling back to the local file")
+            cards = []
+
+    if not cards:
+        cards = _cards_from_file()
+
+    _table_cards_cache = cards
+    _table_cards_cache_mtime = mtime
+    _table_cards_cache_user = user_id
+    _table_cards_cache_expires = now + _TABLE_CARDS_TTL
+    return cards
 
 
 def _infer_column_types(cols: list, rows: list, sample_limit: int = 200) -> dict:
@@ -250,7 +322,7 @@ def execute_sql_query(question: str, user_id: str, supabase_client) -> str:
     # KeyError/TypeError escaping here would otherwise turn a bad cards file
     # into a 500 for every question instead of the documented full-schema
     # fallback.
-    cards = _load_table_cards()
+    cards = _load_table_cards(user_id, supabase_client)
     if cards:
         try:
             selected = set(select_tables(question, cards, k=3))

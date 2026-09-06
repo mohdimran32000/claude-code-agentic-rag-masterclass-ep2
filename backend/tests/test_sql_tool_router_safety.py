@@ -255,7 +255,10 @@ _real_load_cards = sql_tool._load_table_cards
 sql_tool.genai.Client = _FakeGenaiClient
 sql_tool.get_llm_api_key = lambda: "fake-key"
 sql_tool.get_llm_model = lambda: "fake-model"
-sql_tool._load_table_cards = lambda: BAD_CARDS
+# *a/**k: _load_table_cards now takes (user_id, supabase_client) — migration 025
+# moved the cards into the database. This stub ignores both on purpose; what is
+# under test is the routing block's behaviour given bad cards, not their source.
+sql_tool._load_table_cards = lambda *a, **k: BAD_CARDS
 
 raised = None
 result_str = None
